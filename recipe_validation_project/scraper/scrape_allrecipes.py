@@ -73,30 +73,51 @@ def construct_gemini_prompt(recipe_data):
     # Basic prompt, can be greatly expanded
     prompt = f"""
 You are an expert culinary assistant tasked with cleaning and structuring recipe data for a machine learning dataset.
-The goal is to extract key information accurately for recipe validation.
+The goal is to extract key information accurately for recipe validation and enable tracking of ingredient usage through recipe steps.
 
 From the provided recipe data:
-1.  **Validate and Clean Title**: Provide the original title.
+1.  **Validate and Clean Title**: Provide the original title. Store in "cleaned_title".
 2.  **Clean Ingredients List**:
     *   Parse each ingredient into quantity, unit, and name.
     *   Standardize units (e.g., 'tbsp' to 'tablespoon', 'g' to 'gram', 'tsp' to 'teaspoon', 'c' to 'cup').
     *   Output as a list of JSON objects, each with 'quantity', 'unit', 'name', and 'original_text'.
     *   Example: {{"quantity": "1", "unit": "cup", "name": "all-purpose flour", "original_text": "1 cup all-purpose flour"}}
     *   If quantity/unit are not explicit (e.g., "salt to taste"), use appropriate placeholders like "to taste" for quantity and null/empty for unit.
-3.  **Clean Instructions**:
-    *   Break down into clear, sequential steps as a list of strings.
-    *   Ensure each step is a complete action.
+    *   Store this list in "cleaned_ingredients".
+3.  **Clean Instructions and Track Ingredient Usage**:
+    *   Break down into clear, sequential steps.
+    *   For each step, identify the ingredients (using their 'name' from the "cleaned_ingredients" list) that are actively used, combined, or manipulated in that specific step.
+    *   Output as a list of JSON objects. Each object should have:
+        *   'step_number': An integer representing the order of the step (starting from 1).
+        *   'step_text': The original, clear textual instruction for the step.
+        *   'ingredients_used_in_step': A list of strings, where each string is the standardized 'name' of an ingredient used in this step. If no specific ingredient from the list is used (e.g., "Preheat oven"), this list can be empty.
+    *   Example for "cleaned_instructions":
+        ```json
+        [
+          {{
+            "step_number": 1,
+            "step_text": "Preheat oven to 350 degrees F (175 degrees C).",
+            "ingredients_used_in_step": []
+          }},
+          {{
+            "step_number": 2,
+            "step_text": "In a medium bowl, whisk together the flour, baking powder, and salt.",
+            "ingredients_used_in_step": ["all-purpose flour", "baking powder", "salt"]
+          }}
+        ]
+        ```
+    *   Store this list of step objects in "cleaned_instructions".
 4.  **Extract Key Information**:
-    *   Total Time (as provided or standardized, e.g., "PT1H30M" -> "1 hour 30 minutes").
-    *   Yields (as provided).
-    *   Image URL (as provided).
-    *   Host (as provided).
-    *   Nutrients (as provided, keep as a dictionary).
+    *   Total Time (as provided or standardized, e.g., "PT1H30M" -> "1 hour 30 minutes"). Store in "total_time_str".
+    *   Yields (as provided). Store in "yields_str".
+    *   Image URL (as provided). Store in "image_url".
+    *   Host (as provided). Store in "host_str".
+    *   Nutrients (as provided, keep as a dictionary). Store in "nutrients_obj".
 
 Please return the structured data as a single, valid JSON object with the following keys:
 "cleaned_title", "cleaned_ingredients", "cleaned_instructions", "total_time_str", "yields_str", "image_url", "host_str", "nutrients_obj", "original_url".
 
-If a field cannot be determined or is not applicable from the input, use null or an empty list/dictionary as appropriate for its type.
+If a field cannot be determined or is not applicable from the input, use null or an empty list/dictionary as appropriate for its type. Ensure ingredient names in 'ingredients_used_in_step' match those derived in 'cleaned_ingredients'.
 
 Recipe Data:
 ---
@@ -116,74 +137,138 @@ Return ONLY the JSON object.
 """
     return prompt
 
-# Example: Scraping a single recipe from allrecipes.com
-# You will need to expand this to scrape multiple recipes
-# and handle pagination, errors, etc.
+# Global set to keep track of visited collection URLs to avoid redundant fetching and potential loops
+visited_collection_urls = set()
 
-def get_recipe_urls_from_category(category_url):
+def get_recipe_urls_from_category(category_url, depth=0, max_depth=1):
     """
-    Fetches a category page and extracts all unique recipe URLs.
+    Fetches a category or collection page and extracts all unique direct recipe URLs.
+    If depth < max_depth, it will also try to find collection-like pages and fetch recipes from them.
     """
-    recipe_urls = set()
+    global visited_collection_urls
+    print(f"Fetching URLs from: {category_url} (Depth: {depth})")
+
+    if category_url in visited_collection_urls and depth > 0: # Don't skip the initial page
+        print(f"Already visited collection page: {category_url}. Skipping.")
+        return set() # Return a set for consistency
+
+    # Add to visited set when we process it as a collection page link
+    # For the very first call (depth 0), it's the main category, not a "collection link" we followed.
+    if depth > 0:
+        visited_collection_urls.add(category_url)
+
+    direct_recipe_urls_found = set()
+    potential_collection_page_urls = set()
+    link_elements_collector = []
+
     try:
-        # Consider adding a User-Agent header
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        response = requests.get(category_url, headers=headers, timeout=15)
+        # Add a small delay before fetching any category/collection page
+        time.sleep(0.5) # Respectful delay
+        response = requests.get(category_url, headers=headers, timeout=25) # Slightly increased timeout
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Primary selector based on observed structure (e.g., from user-provided HTML)
-        # These are <a> tags that are themselves the "cards" or list items.
-        link_elements = soup.select('a.mntl-card-list-items[data-doc-id]')
+        # --- Strategies for finding <a> elements ---
+        # Strategy 0: User-provided high-priority container
+        high_priority_container_selector = '.comp.tax-sc__recirc-list.card-list.mntl-universal-card-list.mntl-document-card-list.mntl-card-list.mntl-block'
+        high_priority_containers = soup.select(high_priority_container_selector)
+        if high_priority_containers:
+            # print(f"Strategy 0 (High-Priority Container): Found {len(high_priority_containers)} containers with selector '{high_priority_container_selector}'. Searching links within...")
+            for container in high_priority_containers:
+                link_elements_collector.extend(container.select('a[href]')) # Get all links with href first
+        # else:
+            # print(f"Strategy 0 (High-Priority Container): No containers found with selector '{high_priority_container_selector}'.")
 
-        if not link_elements:
-            # Fallback: Try to find links within common list item or card container structures
-            # This was the previous primary strategy, now a fallback.
-            print("Primary selector 'a.mntl-card-list-items[data-doc-id]' found no links. Trying fallback selectors...")
-            possible_card_selectors = ['article.fixed-recipe-card', '.card', '.recipe-card', '.card-list__item'] # Added .card-list__item
-            for selector in possible_card_selectors:
-                cards = soup.select(selector)
-                for card in cards:
-                    # If the card itself is an 'a' tag with a recipe link
-                    if card.name == 'a' and card.get('href') and '/recipe/' in card.get('href'):
-                        link_elements.append(card)
-                    else: # Otherwise, look for 'a' tags within the card
-                        links_in_card = card.select('a[href*="/recipe/"]')
-                        link_elements.extend(links_in_card)
-                if link_elements:
-                    print(f"Found links using fallback selector: {selector}")
-                    break
+        # --- Strategy 1: Primary selector for direct recipe links (or collection links)
+        primary_links_selector = 'a.mntl-card-list-items[data-doc-id][href]' # Broadened to get href
+        primary_links = soup.select(primary_links_selector)
+        if primary_links:
+            link_elements_collector.extend(primary_links)
+            # print(f"Strategy 1 (Direct/Collection Links): Found {len(primary_links)} links with '{primary_links_selector}'.")
         
-        if not link_elements: # Second Fallback to a more general search if specific cards not found
-            print("Fallback selectors found no links. Trying general 'a[href*=\"/recipe/\"]' selector...")
-            link_elements = soup.select('a[href*="/recipe/"]')
+        # --- Strategy 2: User-provided specific group container class
+        group_container_selector = '.comp.mntl-taxonomysc-article-list-group.mntl-block'
+        group_containers = soup.select(group_container_selector)
+        if group_containers:
+            for container in group_containers:
+                link_elements_collector.extend(container.select('a[href]'))
+            # print(f"Strategy 2 (Group Container): Found links within {len(group_containers)} group containers.")
 
-        if not link_elements:
-            print(f"No recipe links found on {category_url} with any attempted selectors.")
+        # --- Strategy 3: Fallback for various card-like structures
+        card_selectors = [
+            '.comp.mntl-card-list-items.mntl-universal-card.mntl-document-card.mntl-card.card.card--no-image[href]',
+            'article.mntl-card-list-items a[href]', '.card.mntl-card-list-items a[href]',
+            '.fixed-recipe-card a[href]', '.comp.mntl-card-list-items[href]', # If the item itself is <a>
+            'li.mntl-block a[href]',
+            '.recipe-card-group__item a[href]'
+        ]
+        for selector in card_selectors:
+            links_from_cards_or_lists = soup.select(selector)
+            if links_from_cards_or_lists:
+                link_elements_collector.extend(links_from_cards_or_lists)
+        # print(f"Strategy 3 (Cards/Lists): Added potential links from various card/list selectors.")
 
-
-        for link_element in link_elements:
+        # --- Strategy 4: General fallback (use sparingly or if others yield little) ---
+        if not link_elements_collector or len(link_elements_collector) < 10 : # Only if very few links found
+            # print(f"Few links found by specific selectors. Trying general 'a[href]' fallback...")
+            general_links = soup.select('main a[href]') # Search within main content area
+            if not general_links:
+                general_links = soup.select('body a[href]') # Broader if main yields nothing
+            link_elements_collector.extend(general_links)
+            # print(f"Strategy 4 (General Fallback): Added {len(general_links)} general links.")
+        
+        # --- Process collected link elements ---
+        processed_hrefs_for_this_page = set()
+        
+        for link_element in link_elements_collector:
             href = link_element.get('href')
-            if href:
-                # Ensure it's a full URL, Allrecipes recipe link, and not a fragment or different domain
-                if href.startswith("https://www.allrecipes.com/recipe/"):
-                    recipe_urls.add(href)
-                elif href.startswith("/recipe/"):
-                    # Check for base URL to avoid issues if category_url is not from www.allrecipes.com (though it should be)
-                    base_url = "https://www.allrecipes.com"
-                    if "allrecipes.com" in category_url: # Basic check
-                         parsed_category_url = requests.utils.urlparse(category_url)
-                         base_url = f"{parsed_category_url.scheme}://{parsed_category_url.netloc}"
-                    recipe_urls.add(f"{base_url}{href}")
-                # else:
-                    # print(f"Skipping non-recipe or non-Allrecipes link: {href}")
+            if not href or href in processed_hrefs_for_this_page:
+                continue
+            processed_hrefs_for_this_page.add(href)
 
+            full_url = href
+            if href.startswith('/'): # Relative URL
+                parsed_origin_url = requests.utils.urlparse(category_url)
+                full_url = f"{parsed_origin_url.scheme}://{parsed_origin_url.netloc}{href}"
+
+            if not full_url.startswith('https://www.allrecipes.com/'):
+                continue # Skip non-allrecipes links
+
+            if '/recipe/' in full_url:
+                # Ensure it looks like a valid recipe URL (e.g., ends with number or string, not /recipes/)
+                if full_url.split('/recipe/')[-1] and not full_url.endswith('/recipe/') and not full_url.endswith('/recipes/'):
+                    direct_recipe_urls_found.add(full_url)
+            elif depth < max_depth:
+                # This is a potential collection page if it doesn't contain /recipe/
+                # and meets criteria (e.g., has data-doc-id or specific classes like the example)
+                # For simplicity now, we'll consider any non-recipe allrecipes link from a card a potential collection.
+                # More specific checks could be link_element.get('data-doc-id') or class checks
+                if link_element.get('data-doc-id') or any(cls in link_element.get('class', []) for cls in ['mntl-card-list-items', 'card--no-image']):
+                     # Avoid adding common non-collection links like /profile/, /account/, /newsletters/, etc.
+                    if not any(kw in full_url for kw in ['/profile/', '/account/', '/newsletter', '/video/', '/gallery/', '.jpg', '.png', '/reviews/', '/photos/', '/submit/', '/survey/', '/print/']):
+                        potential_collection_page_urls.add(full_url)
 
     except requests.RequestException as e:
-        print(f"Error fetching category page {category_url}: {e}")
-    return list(recipe_urls)
+        print(f"Error fetching page {category_url}: {e}")
+        return direct_recipe_urls_found # Return what we have so far
+
+    print(f"Found {len(direct_recipe_urls_found)} direct recipe URLs and {len(potential_collection_page_urls)} potential collection URLs on {category_url}.")
+
+    # If depth allows, explore collection pages
+    if depth < max_depth:
+        for collection_url in potential_collection_page_urls:
+            if collection_url not in visited_collection_urls: # Check again before recursive call
+                # print(f"  Recursively fetching from collection: {collection_url} (Depth: {depth + 1})")
+                recipes_from_collection = get_recipe_urls_from_category(collection_url, depth + 1, max_depth)
+                direct_recipe_urls_found.update(recipes_from_collection)
+            # else:
+                # print(f"  Skipping already visited collection (checked before recursion): {collection_url}")
+
+
+    return direct_recipe_urls_found
 
 def scrape_recipe(url):
     try:
@@ -214,121 +299,125 @@ def scrape_recipe(url):
 if __name__ == "__main__":
     start_category_url = "https://www.allrecipes.com/recipes/78/breakfast-and-brunch/"
     output_directory = "data"
-    # Changed output filename for cleaned data
-    raw_output_filename = os.path.join(output_directory, "allrecipes_breakfast_brunch_raw.jsonl")
-    cleaned_output_filename = os.path.join(output_directory, "allrecipes_breakfast_brunch_cleaned.jsonl")
-
+    cleaned_output_filename = os.path.join(output_directory, "allrecipes_breakfast_brunch_cleaned.json")
 
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
 
     if not GOOGLE_API_KEY or not gemini_model:
-        print("Warning: Gemini API key not set or model not initialized. Will only save raw scraped data.")
-        # Fallback to only saving raw data if Gemini isn't set up
-        cleaned_output_filename = raw_output_filename
+        print("Error: Gemini API key not set or model not initialized. Cleaned data cannot be produced. Exiting.")
+        exit()
 
-
-    print(f"Starting scrape for category: {start_category_url}")
-    recipe_urls_to_scrape = get_recipe_urls_from_category(start_category_url)
+    print(f"Starting recursive scrape for category: {start_category_url}")
+    # Clear visited collection URLs at the start of a new top-level run
+    visited_collection_urls.clear()
+    # Initial call to get all recipe URLs, including from one level of collection pages
+    recipe_urls_to_scrape_set = get_recipe_urls_from_category(start_category_url, depth=0, max_depth=1)
+    recipe_urls_to_scrape = list(recipe_urls_to_scrape_set)
     
     if not recipe_urls_to_scrape:
-        print(f"No recipe URLs found on {start_category_url}. Exiting.")
+        print(f"No recipe URLs found from {start_category_url} or its collections. Exiting.")
     else:
-        print(f"Found {len(recipe_urls_to_scrape)} recipe URLs to scrape.")
+        print(f"Found a total of {len(recipe_urls_to_scrape)} unique recipe URLs to scrape.")
+        # print("URLs to scrape:", recipe_urls_to_scrape[:20]) # Print some for verification
 
         scraped_count = 0
         processed_count = 0
-        # Open two files: one for raw, one for cleaned if Gemini is available
-        with open(raw_output_filename, "a") as raw_f, \
-             (open(cleaned_output_filename, "a") if GOOGLE_API_KEY and gemini_model else open(os.devnull, 'w')) as cleaned_f:
+        all_cleaned_recipes = []
 
-            for i, recipe_url in enumerate(recipe_urls_to_scrape):
-                print(f"Scraping recipe {i+1}/{len(recipe_urls_to_scrape)}: {recipe_url}")
-                recipe_data = scrape_recipe(recipe_url)
-                
-                if recipe_data:
-                    # Save raw data
-                    json.dump(recipe_data, raw_f)
-                    raw_f.write("\n")
-                    print(f"Successfully scraped raw data: {recipe_data.get('title')}")
-                    scraped_count += 1
+        for i, recipe_url in enumerate(recipe_urls_to_scrape):
+            print(f"Scraping recipe {i+1}/{len(recipe_urls_to_scrape)}: {recipe_url}")
+            # Ensure we don't re-scrape if somehow a non-recipe URL slipped through initial filtering
+            if "/recipe/" not in recipe_url:
+                print(f"Skipping non-recipe URL that was collected: {recipe_url}")
+                continue
 
-                    # Process with Gemini if available
-                    if GOOGLE_API_KEY and gemini_model:
-                        print(f"Processing with Gemini: {recipe_data.get('title')}")
-                        prompt = construct_gemini_prompt(recipe_data)
-                        try:
-                            response = gemini_model.generate_content(prompt)
-                            # Basic check if response.text exists
-                            if hasattr(response, 'text') and response.text:
-                                cleaned_data_str = response.text.strip()
-                                # Gemini might return markdown ```json ... ```, try to extract
-                                if cleaned_data_str.startswith("```json"):
-                                    cleaned_data_str = cleaned_data_str[7:]
-                                if cleaned_data_str.endswith("```"):
-                                    cleaned_data_str = cleaned_data_str[:-3]
-                                
-                                try:
-                                    cleaned_json = json.loads(cleaned_data_str)
-                                    # Add original URL if not already in the cleaned data by Gemini
-                                    if 'original_url' not in cleaned_json:
-                                        cleaned_json['original_url'] = recipe_data.get('canonical_url')
-                                    
-                                    json.dump(cleaned_json, cleaned_f)
-                                    cleaned_f.write("\n")
-                                    print(f"Successfully processed by Gemini and saved: {cleaned_json.get('cleaned_title')}")
-                                    processed_count +=1
-                                except json.JSONDecodeError as json_e:
-                                    print(f"Error: Gemini API response was not valid JSON for '{recipe_data.get('title')}'. Error: {json_e}")
-                                    print(f"Gemini response text: {response.text[:500]}...") # Log part of the response
-                                except Exception as e_parse:
-                                    print(f"Error parsing Gemini's JSON response for '{recipe_data.get('title')}'. Error: {e_parse}")
-                                    print(f"Gemini response text: {response.text[:500]}...")
-                            else: # Handle cases where response.text might be empty or missing
-                                print(f"Error: Gemini API response was empty or malformed for {recipe_data.get('title')}. Response: {response}")
-                                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                                     print(f"Prompt Feedback: {response.prompt_feedback}")
+            recipe_data = scrape_recipe(recipe_url)
+            
+            if recipe_data:
+                print(f"Raw data scraped for: {recipe_data.get('title')}")
+                scraped_count += 1
 
+                if GOOGLE_API_KEY and gemini_model: # This check is technically redundant due to exit above but good practice
+                    print(f"Processing with Gemini: {recipe_data.get('title')}")
+                    prompt = construct_gemini_prompt(recipe_data)
+                    try:
+                        response = gemini_model.generate_content(prompt)
+                        if hasattr(response, 'text') and response.text:
+                            cleaned_data_str = response.text.strip()
+                            if cleaned_data_str.startswith("```json"):
+                                cleaned_data_str = cleaned_data_str[7:]
+                            if cleaned_data_str.endswith("```"):
+                                cleaned_data_str = cleaned_data_str[:-3]
+                            
+                            try:
+                                cleaned_json = json.loads(cleaned_data_str)
+                                if 'original_url' not in cleaned_json and recipe_data.get('canonical_url'):
+                                    cleaned_json['original_url'] = recipe_data.get('canonical_url')
+                                elif 'original_url' not in cleaned_json: # Fallback if canonical_url was also None
+                                     cleaned_json['original_url'] = recipe_url
 
-                        except Exception as e_gemini:
-                            print(f"Error calling Gemini API for '{recipe_data.get('title')}': {e_gemini}")
-                            if hasattr(e_gemini, 'response') and hasattr(e_gemini.response, 'prompt_feedback'):
-                                print(f"Prompt Feedback: {e_gemini.response.prompt_feedback}")
-
-                    elif not (GOOGLE_API_KEY and gemini_model):
-                        # If not using Gemini, we just write the raw data to the "cleaned" file as well,
-                        # or simply don't process further if cleaned_output_filename was set to raw_output_filename.
-                        # For clarity, if Gemini isn't setup, cleaned_output_filename is raw_output_filename,
-                        # so no extra write needed here.
-                        pass
-
-
-                else:
-                    print(f"Failed to scrape {recipe_url}")
-                
-                # Be respectful: wait a bit between requests
-                # Increase delay if making API calls per recipe
-                time.sleep(2 if GOOGLE_API_KEY and gemini_model else 1) 
+                                all_cleaned_recipes.append(cleaned_json)
+                                print(f"Successfully processed by Gemini: {cleaned_json.get('cleaned_title')}")
+                                processed_count +=1
+                            except json.JSONDecodeError as json_e:
+                                print(f"Error: Gemini API response was not valid JSON for '{recipe_data.get('title')}'. Error: {json_e}")
+                                print(f"Gemini response text: {response.text[:500]}...")
+                            except Exception as e_parse:
+                                print(f"Error parsing Gemini's JSON response for '{recipe_data.get('title')}'. Error: {e_parse}")
+                                print(f"Gemini response text: {response.text[:500]}...")
+                        else:
+                            print(f"Error: Gemini API response was empty or malformed for {recipe_data.get('title')}. Response: {response}")
+                            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                                 print(f"Prompt Feedback: {response.prompt_feedback}")
+                    except Exception as e_gemini:
+                        print(f"Error calling Gemini API for '{recipe_data.get('title')}': {e_gemini}")
+                        if hasattr(e_gemini, 'response') and hasattr(e_gemini.response, 'prompt_feedback'):
+                            print(f"Prompt Feedback: {e_gemini.response.prompt_feedback}")
+            else:
+                print(f"Failed to scrape {recipe_url}")
+            
+            time.sleep(1.5) # Adjusted sleep: 2s if Gemini was used, 1s if not. Now consistent 1.5s. Consider longer if rate limited.
         
+        if all_cleaned_recipes: # Check if list is not empty
+            with open(cleaned_output_filename, "w") as cleaned_f:
+                json.dump(all_cleaned_recipes, cleaned_f, indent=4)
+            print(f"Successfully saved {len(all_cleaned_recipes)} cleaned recipes to {cleaned_output_filename}.")
+        elif not (GOOGLE_API_KEY and gemini_model): # This case should be caught by the exit() earlier
+             print(f"Gemini processing was skipped. No cleaned JSON file produced.")
+        elif not all_cleaned_recipes and recipe_urls_to_scrape: # Recipes were found, but none processed.
+            print(f"No recipes were successfully processed by Gemini, or no recipe data was usable. Cleaned JSON file not created.")
+        else: # No recipes found to scrape to begin with.
+            print(f"No recipes processed. Cleaned JSON file not created.")
+
+
         print(f"\nScraping complete.")
-        print(f"Successfully scraped {scraped_count}/{len(recipe_urls_to_scrape)} raw recipes to {raw_output_filename}.")
+        print(f"Successfully scraped data for {scraped_count}/{len(recipe_urls_to_scrape)} recipes.")
         if GOOGLE_API_KEY and gemini_model:
-            print(f"Successfully processed {processed_count}/{scraped_count} recipes with Gemini to {cleaned_output_filename}.")
+            print(f"Successfully processed {processed_count}/{scraped_count} recipes with Gemini.")
         else:
-            print(f"Gemini processing was skipped (API key or model not initialized). Raw data only in {raw_output_filename}.")
+            print(f"Gemini processing was skipped (API key or model not initialized). No cleaned output file produced.")
 
 
 # TODO:
+# 1. Pagination for categories that list many more recipes than fit on one page.
+# 2. More robust error handling and retries (e.g., for network issues, API rate limits).
+# 3. Logging module.
+# 4. Refine collection page identification if needed.
+# 5. Ensure delays are respectful of robots.txt and terms of service. Current sleep is basic.
+# 6. Consider making max_depth configurable.
+# 7. The selectors in `get_recipe_urls_from_category` might still need refinement for different page layouts.
+
 # 1. Implement logic to find and scrape thousands of recipes from allrecipes.com.
 #    This might involve finding sitemap.xml, category pages, or other navigation patterns.
 #    Robust pagination handling for category pages is needed.
 # 2. Add robust error handling and retries (e.g., for network issues, API rate limits).
-# 3. Consider how to store the scraped data (e.g., multiple JSON files, a database). (JSONL is a good start)
+# 3. Consider how to store the scraped data (e.g., multiple JSON files, a database). (Single JSON for cleaned)
 # 4. Implement logging using the `logging` module for better tracking.
 # 5. Be respectful of the website's terms of service and robots.txt.
 #    Implement delays between requests to avoid overwhelming their servers. (Basic delay added, increased if using Gemini)
 # 6. The CSS selectors in `get_recipe_urls_from_category` might need refinement
-#    if the website structure changes or for different category page layouts.
+#    if the website structure changes or for different category page layouts. (Refined)
 # 7. Add user-agent to requests. (Added)
 # 8. Securely manage API Key for Gemini (using environment variable is a good start).
 # 9. Refine Gemini prompt for better accuracy and desired output structure.
@@ -338,10 +427,10 @@ if __name__ == "__main__":
 #    This might involve finding sitemap.xml, category pages, or other navigation patterns.
 #    Robust pagination handling for category pages is needed.
 # 2. Add robust error handling and retries (e.g., for network issues).
-# 3. Consider how to store the scraped data (e.g., multiple JSON files, a database). (JSONL is a good start)
+# 3. Consider how to store the scraped data (e.g., multiple JSON files, a database). (Single JSON for cleaned)
 # 4. Implement logging using the `logging` module for better tracking.
 # 5. Be respectful of the website's terms of service and robots.txt.
 #    Implement delays between requests to avoid overwhelming their servers. (Basic delay added)
 # 6. The CSS selectors in `get_recipe_urls_from_category` might need refinement
-#    if the website structure changes or for different category page layouts.
+#    if the website structure changes or for different category page layouts. (Refined)
 # 7. Add user-agent to requests. 
