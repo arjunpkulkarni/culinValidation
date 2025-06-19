@@ -1,3 +1,7 @@
 recipe-scrapers
 fastapi
-uvicorn 
+uvicorn
+transformers
+torch
+datasets
+scikit-learn 
