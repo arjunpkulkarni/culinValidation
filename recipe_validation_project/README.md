@@ -1,4 +1,4 @@
-# CULINAI RECIPE VALIDATION MODEL
+# CULIN RECIPE VALIDATION MODEL
 
 This project aims to scrape recipes, clean the data, and train a model to validate recipes. 
 The validation model is exposed via a FastAPI.
